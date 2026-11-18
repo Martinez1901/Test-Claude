@@ -1,5 +1,8 @@
 import * as THREE from 'three';
 import { toCreasedNormals } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { createRover } from './rover.js';
+import { initMissionControl } from './mission.js';
+import { initCameras } from './cameras.js';
 
 // ---------- ruido ----------
 function hash(x, y) {
@@ -98,8 +101,8 @@ sun.shadow.radius = 5;
 sun.shadow.bias = -0.0004;
 sun.shadow.normalBias = 0.05;
 const sc = sun.shadow.camera;
-sc.left = -70; sc.right = 70; sc.top = 70; sc.bottom = -70; sc.near = 1; sc.far = 400;
-scene.add(sun);
+sc.left = -55; sc.right = 55; sc.top = 55; sc.bottom = -55; sc.near = 1; sc.far = 400;
+scene.add(sun, sun.target); // el sol y su sombra siguen al rover
 scene.add(new THREE.HemisphereLight(0xf0a870, 0x8a4a22, 1.4));
 
 // ---------- terreno ----------
@@ -127,6 +130,22 @@ tGeo.rotateX(-Math.PI / 2);
     colors.set([c.r, c.g, c.b], i * 3);
   }
   tGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+}
+
+// Altura EXACTA de la malla renderizada (misma triangulación que PlaneGeometry), no del ruido:
+// así las ruedas y las huellas apoyan justo sobre lo que se ve.
+const heights = new Float32Array(tGeo.attributes.position.count);
+for (let i = 0; i < heights.length; i++) heights[i] = tGeo.attributes.position.getY(i);
+function groundHeight(x, z) {
+  const cell = SIZE / SEG;
+  const gx = THREE.MathUtils.clamp((x + SIZE / 2) / cell, 0, SEG - 1e-6);
+  const gz = THREE.MathUtils.clamp((z + SIZE / 2) / cell, 0, SEG - 1e-6);
+  const ix = Math.floor(gx), iz = Math.floor(gz), u = gx - ix, v = gz - iz;
+  const row = SEG + 1;
+  const a = heights[ix + row * iz], b = heights[ix + row * (iz + 1)];
+  const c = heights[ix + 1 + row * (iz + 1)], d = heights[ix + 1 + row * iz];
+  // PlaneGeometry: triángulos (a,b,d) y (b,c,d); la diagonal es b–d
+  return u + v <= 1 ? a + u * (d - a) + v * (b - a) : c + (1 - u) * (b - c) + (1 - v) * (d - c);
 }
 function rippleNormalMap() {
   const N = 256, h = new Float32Array(N * N);
@@ -291,6 +310,9 @@ const phobos = makeMoon(1, new THREE.Vector3(1.25, 0.95, 1), 3.1, '#8a6a58', new
 phobos.scale.setScalar(70);
 const deimos = makeMoon(1, new THREE.Vector3(1.1, 0.95, 1), 7.7, '#9a7a62', new THREE.Vector3(0.52, 0.28, -0.8), 1500);
 deimos.scale.setScalar(26);
+const skyGroup = new THREE.Group(); // cielo y lunas viajan con la cámara: sin paralaje, siempre en el infinito
+skyGroup.add(sky, phobos, deimos);
+scene.add(skyGroup);
 
 // ---------- polvo ----------
 const dustTex = (() => {
@@ -307,27 +329,53 @@ const dPos = new Float32Array(DUST * 3);
 for (let i = 0; i < DUST; i++) {
   dPos[i * 3] = (Math.random() - 0.5) * 160;
   dPos[i * 3 + 1] = Math.random() * 18 + 0.5;
-  dPos[i * 3 + 2] = -Math.random() * 120 + 20;
+  dPos[i * 3 + 2] = (Math.random() - 0.5) * 140;
 }
 dGeo.setAttribute('position', new THREE.BufferAttribute(dPos, 3));
 const dust = new THREE.Points(dGeo, new THREE.PointsMaterial({
   map: dustTex, size: 1.6, transparent: true, opacity: 0.35, depthWrite: false, color: 0xffc58a,
 }));
+dust.frustumCulled = false;
 scene.add(dust);
 
-// ---------- cámara y bucle ----------
-const base = new THREE.Vector3(0, 0, 18);
-base.y = terrainHeight(base.x, base.z) + 2.6;
-function frame(t) {
-  const x = Math.sin(t * 0.00006) * 6;
-  camera.position.set(x, terrainHeight(x, base.z) + 2.6 + Math.sin(t * 0.0002) * 0.15, base.z);
-  camera.lookAt(x * 0.5 - 4, camera.position.y + 3.2, -40);
-  const p = dGeo.attributes.position;
+// ---------- rover, cámara y bucle ----------
+const hud = document.getElementById('hud');
+initMissionControl(); // panel de la tecla T; carga sus datos en paralelo con el rover
+const rover = await createRover({ scene, camera, renderer, skyMesh: sky, groundHeight });
+hud.classList.add('ready');
+const cameras = await initCameras({ camera, renderer, rover }); // puntos que brillan sobre las cámaras
+
+// El mapa de sombras sigue al rover, ajustado a la rejilla de texeles para que no parpadee.
+const texel = (sc.right - sc.left) / sun.shadow.mapSize.x;
+const lz = sunDir.clone(), lx = new THREE.Vector3(0, 1, 0).cross(lz).normalize(), ly = lz.clone().cross(lx);
+function followSun() {
+  const p = new THREE.Vector3(rover.state.x, rover.state.y, rover.state.z);
+  const a = Math.round(p.dot(lx) / texel) * texel, b = Math.round(p.dot(ly) / texel) * texel, c = p.dot(lz);
+  sun.target.position.copy(lx).multiplyScalar(a).addScaledVector(ly, b).addScaledVector(lz, c);
+  sun.position.copy(sun.target.position).addScaledVector(sunDir, 150);
+}
+
+const timer = new THREE.Timer();
+function frame() {
+  timer.update();
+  const dt = timer.getDelta();
+  rover.update(dt);
+  followSun();
+  skyGroup.position.copy(camera.position);
+  cameras.update?.(performance.now());
+
+  // el polvo se envuelve alrededor del rover
+  const p = dGeo.attributes.position, rs = rover.state;
   for (let i = 0; i < DUST; i++) {
     p.array[i * 3] += 0.03;
-    if (p.array[i * 3] > 80) p.array[i * 3] = -80;
+    if (p.array[i * 3] - rs.x > 80) p.array[i * 3] -= 160;
+    else if (p.array[i * 3] - rs.x < -80) p.array[i * 3] += 160;
+    if (p.array[i * 3 + 2] - rs.z > 70) p.array[i * 3 + 2] -= 140;
+    else if (p.array[i * 3 + 2] - rs.z < -70) p.array[i * 3 + 2] += 140;
   }
   p.needsUpdate = true;
+
+  hud.querySelector('.speed').textContent = Math.abs(rs.speed).toFixed(1);
   renderer.render(scene, camera);
   window.__frames = (window.__frames || 0) + 1;
   requestAnimationFrame(frame);
